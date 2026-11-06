@@ -1,0 +1,303 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Iceberg drop</title>
+<style>
+  :root {
+    color-scheme: dark;
+    --bg: #121816;
+    --panel: #1c2622;
+    --line: #31423b;
+    --text: #e7f0ea;
+    --muted: #93a79c;
+    --ice: #8fd0c6;
+    --warn: #e2b657;
+    --bad: #e07a62;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    background: var(--bg);
+    color: var(--text);
+    font: 15px/1.4 "Segoe UI", Helvetica, Arial, sans-serif;
+  }
+  header {
+    display: flex;
+    justify-content: space-between;
+    gap: 16px;
+    align-items: baseline;
+    padding: 18px 22px 8px;
+  }
+  h1 { font-size: 20px; font-weight: 600; margin: 0; }
+  #status { color: var(--muted); }
+  main { padding: 8px 22px 28px; }
+  .cards {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
+    gap: 10px;
+    margin: 12px 0 16px;
+  }
+  .card {
+    background: var(--panel);
+    border: 1px solid var(--line);
+    border-radius: 8px;
+    padding: 10px 12px;
+  }
+  .card span { display: block; color: var(--muted); font-size: 12px; letter-spacing: 0.02em; }
+  .card strong { display: block; margin-top: 4px; font-size: 22px; font-weight: 600; font-variant-numeric: tabular-nums; }
+  .grid {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 12px;
+  }
+  @media (max-width: 800px) { .grid { grid-template-columns: 1fr; } }
+  figure {
+    margin: 0;
+    background: var(--panel);
+    border: 1px solid var(--line);
+    border-radius: 8px;
+    padding: 10px;
+  }
+  figcaption { color: var(--muted); font-size: 12px; margin-bottom: 6px; }
+  canvas { width: 100%; height: 220px; display: block; }
+  table { width: 100%; border-collapse: collapse; margin-top: 14px; font-variant-numeric: tabular-nums; }
+  th, td { text-align: left; padding: 6px 8px; border-bottom: 1px solid var(--line); font-size: 13px; }
+  th { color: var(--muted); font-weight: 500; }
+  .bad { color: var(--bad); }
+  .warn { color: var(--warn); }
+</style>
+</head>
+<body>
+<header>
+  <h1>Iceberg drop</h1>
+  <div id="status">waiting for the gateway</div>
+</header>
+<main>
+  <div class="cards" id="cards"></div>
+  <div class="grid">
+    <figure>
+      <figcaption>Position relative to the first fix, metres</figcaption>
+      <canvas id="map" width="640" height="440"></canvas>
+    </figure>
+    <figure>
+      <figcaption>Temperature, humidity, height</figcaption>
+      <canvas id="chart" width="640" height="440"></canvas>
+    </figure>
+  </div>
+  <table>
+    <thead>
+      <tr><th>Time</th><th>Lat</th><th>Lon</th><th>Height m</th><th>Temp</th><th>RH</th><th>Battery</th><th>Move</th><th>RSSI</th></tr>
+    </thead>
+    <tbody id="rows"></tbody>
+  </table>
+</main>
+<script>
+const samples = [];
+const MAX = 500;
+
+function num(v) { return typeof v === "number" && isFinite(v) ? v : null; }
+
+function haversine(a, b) {
+  if (a.lat == null || b.lat == null) return null;
+  const R = 6371000;
+  const p1 = a.lat * Math.PI / 180, p2 = b.lat * Math.PI / 180;
+  const dp = (b.lat - a.lat) * Math.PI / 180;
+  const dl = (b.lon - a.lon) * Math.PI / 180;
+  const h = Math.sin(dp / 2) ** 2 + Math.cos(p1) * Math.cos(p2) * Math.sin(dl / 2) ** 2;
+  return 2 * R * Math.asin(Math.min(1, Math.sqrt(h)));
+}
+
+function metresFrom(origin, p) {
+  if (origin.lat == null || p.lat == null) return null;
+  const lat0 = origin.lat * Math.PI / 180;
+  const x = (p.lon - origin.lon) * Math.PI / 180 * Math.cos(lat0) * 6371000;
+  const y = (p.lat - origin.lat) * Math.PI / 180 * 6371000;
+  return { x: x, y: y };
+}
+
+function fmt(v, digits, unit) {
+  if (v == null) return "—";
+  return v.toFixed(digits) + (unit || "");
+}
+
+function fmtTime(s) {
+  if (!s.unix) return "—";
+  const d = new Date(s.unix * 1000);
+  return d.toLocaleString(undefined, { hour12: false });
+}
+
+function card(label, value, cls) {
+  return '<div class="card"><span>' + label + '</span><strong class="' + (cls || "") + '">' + value + '</strong></div>';
+}
+
+function renderCards() {
+  const last = samples[samples.length - 1];
+  const el = document.getElementById("cards");
+  if (!last) {
+    el.innerHTML = card("Samples", "0");
+    return;
+  }
+  const firstFix = samples.find(s => s.lat != null);
+  const prev = samples.length > 1 ? samples[samples.length - 2] : null;
+  const fromFirst = firstFix ? haversine(firstFix, last) : null;
+  const step = prev ? haversine(prev, last) : null;
+  const tempLabel = last.die_temp ? "Die temp" : "Air temp";
+  const battCls = last.critical ? "bad" : (last.batt_mv && last.batt_mv < 3500 ? "warn" : "");
+  el.innerHTML = [
+    card("Node", last.node),
+    card("Latitude", last.lat == null ? "no fix" : last.lat.toFixed(6)),
+    card("Longitude", last.lon == null ? "no fix" : last.lon.toFixed(6)),
+    card("From first fix", fromFirst == null ? "—" : (fromFirst < 1000 ? fromFirst.toFixed(1) + " m" : (fromFirst / 1000).toFixed(2) + " km")),
+    card("Since previous", step == null ? "—" : step.toFixed(1) + " m"),
+    card("Height", fmt(last.alt_m, 1, " m")),
+    card(tempLabel, fmt(last.temp_c, 2, " °C")),
+    card("Humidity", last.rh == null ? "—" : last.rh.toFixed(1) + " %"),
+    card("Battery", last.batt_mv ? (last.batt_mv / 1000).toFixed(2) + " V" : "—", battCls),
+    card("Sats / HDOP", (last.sats || 0) + " / " + (last.hdop == null ? "—" : last.hdop.toFixed(1))),
+    card("Motion", last.motion ? "rolling" : "calm", last.motion ? "warn" : ""),
+    card("Link", last.rssi == null ? last.src : (last.rssi.toFixed(0) + " dBm"))
+  ].join("");
+}
+
+function drawMap() {
+  const canvas = document.getElementById("map");
+  const ctx = canvas.getContext("2d");
+  const w = canvas.width, h = canvas.height;
+  ctx.clearRect(0, 0, w, h);
+  const origin = samples.find(s => s.lat != null);
+  const pts = [];
+  if (origin) {
+    samples.forEach(s => {
+      const m = metresFrom(origin, s);
+      if (m) pts.push(m);
+    });
+  }
+  ctx.strokeStyle = "#31423b";
+  ctx.beginPath();
+  ctx.moveTo(40, 20); ctx.lineTo(40, h - 28); ctx.lineTo(w - 16, h - 28);
+  ctx.stroke();
+  if (!pts.length) {
+    ctx.fillStyle = "#93a79c";
+    ctx.fillText("No fix yet", 52, 40);
+    return;
+  }
+  let max = 10;
+  pts.forEach(p => { max = Math.max(max, Math.abs(p.x), Math.abs(p.y)); });
+  const scale = Math.min((w - 70) / (2 * max), (h - 60) / (2 * max));
+  const cx = 40 + (w - 56) / 2;
+  const cy = (h - 28) / 2;
+  ctx.strokeStyle = "#8fd0c6";
+  ctx.beginPath();
+  pts.forEach((p, i) => {
+    const x = cx + p.x * scale;
+    const y = cy - p.y * scale;
+    if (i === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
+  });
+  ctx.stroke();
+  const last = pts[pts.length - 1];
+  ctx.fillStyle = "#e2b657";
+  ctx.beginPath();
+  ctx.arc(cx + last.x * scale, cy - last.y * scale, 4, 0, Math.PI * 2);
+  ctx.fill();
+  ctx.fillStyle = "#93a79c";
+  ctx.fillText("±" + max.toFixed(0) + " m", 52, h - 10);
+}
+
+function series(key) {
+  const out = [];
+  samples.forEach((s, i) => { if (s[key] != null) out.push({ i: i, v: s[key] }); });
+  return out;
+}
+
+function drawSeries(ctx, data, color, x0, y0, w, h) {
+  if (data.length < 1) return;
+  let lo = data[0].v, hi = data[0].v;
+  data.forEach(p => { lo = Math.min(lo, p.v); hi = Math.max(hi, p.v); });
+  if (hi - lo < 0.5) { lo -= 0.5; hi += 0.5; }
+  const n = Math.max(1, samples.length - 1);
+  ctx.strokeStyle = color;
+  ctx.beginPath();
+  data.forEach((p, k) => {
+    const x = x0 + (p.i / n) * w;
+    const y = y0 + h - ((p.v - lo) / (hi - lo)) * h;
+    if (k === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
+  });
+  ctx.stroke();
+  ctx.fillStyle = color;
+  ctx.fillText(lo.toFixed(1) + " … " + hi.toFixed(1), x0 + 4, y0 + 12);
+}
+
+function drawChart() {
+  const canvas = document.getElementById("chart");
+  const ctx = canvas.getContext("2d");
+  const w = canvas.width, h = canvas.height;
+  ctx.clearRect(0, 0, w, h);
+  const bands = [
+    { key: "temp_c", color: "#e07a62", label: "temp °C" },
+    { key: "rh", color: "#8fd0c6", label: "humidity %" },
+    { key: "alt_m", color: "#e2b657", label: "height m" }
+  ];
+  const bh = Math.floor((h - 16) / bands.length);
+  bands.forEach((b, i) => {
+    const y = 8 + i * bh;
+    ctx.fillStyle = "#93a79c";
+    ctx.fillText(b.label, 8, y + 12);
+    drawSeries(ctx, series(b.key), b.color, 90, y + 4, w - 106, bh - 18);
+  });
+}
+
+function renderRows() {
+  const body = document.getElementById("rows");
+  const slice = samples.slice(-12).reverse();
+  body.innerHTML = slice.map(s => {
+    return "<tr><td>" + fmtTime(s) + "</td><td>" + (s.lat == null ? "—" : s.lat.toFixed(5)) +
+      "</td><td>" + (s.lon == null ? "—" : s.lon.toFixed(5)) +
+      "</td><td>" + fmt(s.alt_m, 1) + "</td><td>" + fmt(s.temp_c, 2) +
+      "</td><td>" + (s.rh == null ? "—" : s.rh.toFixed(0)) +
+      "</td><td>" + (s.batt_mv || "—") + "</td><td>" + (s.motion ? "yes" : "") +
+      "</td><td>" + (s.rssi == null ? s.src : s.rssi.toFixed(0)) + "</td></tr>";
+  }).join("");
+}
+
+function render() {
+  const last = samples[samples.length - 1];
+  const status = document.getElementById("status");
+  if (!last) status.textContent = "waiting for the gateway";
+  else status.textContent = samples.length + " samples · last " + fmtTime(last) + (last.motion ? " · motion" : "");
+  renderCards();
+  drawMap();
+  drawChart();
+  renderRows();
+}
+
+function push(obj) {
+  const prev = samples[samples.length - 1];
+  if (prev && prev.node === obj.node && prev.seq === obj.seq && prev.src === obj.src) return;
+  samples.push(obj);
+  if (samples.length > MAX) samples.shift();
+  render();
+}
+
+async function start() {
+  try {
+    const res = await fetch("/api/recent");
+    const data = await res.json();
+    (data.lines || []).forEach(push);
+  } catch (e) {
+    document.getElementById("status").textContent = "page is not being served by monitor.py";
+  }
+  render();
+  const ev = new EventSource("/events");
+  ev.onmessage = (msg) => {
+    try { push(JSON.parse(msg.data)); } catch (e) {}
+  };
+  ev.onerror = () => {
+    document.getElementById("status").textContent = "stream disconnected";
+  };
+}
+start();
+</script>
+</body>
+</html>
